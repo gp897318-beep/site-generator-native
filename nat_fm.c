@@ -232,10 +232,17 @@ static const char *KEYS[7] = {"title", "date", "tags", "draft", "layout", "slug"
 
 int parse_front_matter(const char *text, size_t n, Arena *a, FMData *data_out, Slice *body_out, StrBuf *err_out) {
   memset(data_out, 0, sizeof(*data_out));
-  // split into lines
+  // Split into lines, but STOP as soon as the closing "---" is found.
+  // The body is never split: it is exactly the contiguous slice of the
+  // text after the closing fence's newline (joining the remaining lines
+  // with '\n' reconstructs that slice byte-for-byte, including the
+  // trailing-newline and no-trailing-newline cases), so no copy is needed.
+  // This avoids a scalar scan of the whole body plus a full body memcpy.
   size_t cap = 32, nlines = 0;
   Slice *lines = (Slice *)arena_alloc(a, cap * sizeof(Slice));
   size_t s = 0;
+  long close = -1;
+  size_t body_start = n;
   for (size_t i = 0; i <= n; i++) {
     if (i == n || text[i] == '\n') {
       if (nlines == cap) {
@@ -246,6 +253,12 @@ int parse_front_matter(const char *text, size_t n, Arena *a, FMData *data_out, S
         cap = nc;
       }
       lines[nlines++] = sl(text + s, i - s);
+      if (nlines > 1 && slice_eq_cstr(lines[nlines - 1], "---")) {
+        close = (long)(nlines - 1);
+        body_start = i + 1;
+        if (body_start > n) body_start = n;
+        break;
+      }
       s = i + 1;
     }
   }
@@ -253,12 +266,6 @@ int parse_front_matter(const char *text, size_t n, Arena *a, FMData *data_out, S
     sb_addcstr(err_out, "no front matter");
     return 1;
   }
-  long close = -1;
-  for (size_t i = 1; i < nlines; i++)
-    if (slice_eq_cstr(lines[i], "---")) {
-      close = (long)i;
-      break;
-    }
   if (close == -1) {
     sb_addcstr(err_out, "the front matter is not closed");
     return 1;
@@ -324,17 +331,8 @@ int parse_front_matter(const char *text, size_t n, Arena *a, FMData *data_out, S
     sb_addcstr(err_out, "no title");
     return 1;
   }
-  // body = lines[close+1..].join('\n')
-  size_t blen = 0;
-  for (size_t i = (size_t)close + 1; i < nlines; i++) blen += lines[i].n + (i + 1 < nlines ? 1 : 0);
-  char *body = (char *)arena_alloc(a, blen + 1);
-  size_t o = 0;
-  for (size_t i = (size_t)close + 1; i < nlines; i++) {
-    memcpy(body + o, lines[i].p, lines[i].n);
-    o += lines[i].n;
-    if (i + 1 < nlines) body[o++] = '\n';
-  }
-  body[o] = '\0';
-  *body_out = sl(body, o);
+  // body = text[body_start..n] (see the note at the top of this function:
+  // the join of the remaining lines is exactly this slice, no copy needed).
+  *body_out = sl(text + body_start, n - body_start);
   return 0;
 }

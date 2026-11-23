@@ -9,6 +9,7 @@ typedef struct {
   size_t n, i;
   Arena *a;
   StrBuf *err;
+  StrBuf *scratch; // reused across jp_string calls: one buffer per parse, not per string
 } JP;
 
 static void jp_err(JP *j, const char *what) {
@@ -46,25 +47,24 @@ static int parse_hex4(const char *p, uint32_t *out) {
 }
 
 // Parse a string starting at the opening quote. 0 ok.
+// Uses j->scratch (reset per call) instead of a fresh malloc/free pair.
 static int jp_string(JP *j, Slice *out) {
   // j->p[j->i] == '"'
   j->i++;
-  StrBuf b;
-  sb_init(&b);
+  StrBuf *b = j->scratch;
+  b->len = 0;
   static const uint8_t SET[2] = {'"', '\\'};
   while (1) {
     if (j->i >= j->n) {
-      sb_free(&b);
       jp_err(j, "unterminated string");
       return 1;
     }
     size_t f = sse2_find_any(j->p + j->i, j->n - j->i, SET, 2);
     if (f >= j->n - j->i) {
-      sb_free(&b);
       jp_err(j, "unterminated string");
       return 1;
     }
-    sb_addn(&b, j->p + j->i, f);
+    sb_addn(b, j->p + j->i, f);
     j->i += f;
     char c = j->p[j->i];
     if (c == '"') {
@@ -74,24 +74,22 @@ static int jp_string(JP *j, Slice *out) {
     // c == '\\'
     j->i++;
     if (j->i >= j->n) {
-      sb_free(&b);
       jp_err(j, "unterminated escape");
       return 1;
     }
     char e = j->p[j->i++];
     switch (e) {
-      case '"': sb_addc(&b, '"'); break;
-      case '\\': sb_addc(&b, '\\'); break;
-      case '/': sb_addc(&b, '/'); break;
-      case 'b': sb_addc(&b, '\b'); break;
-      case 'f': sb_addc(&b, '\f'); break;
-      case 'n': sb_addc(&b, '\n'); break;
-      case 'r': sb_addc(&b, '\r'); break;
-      case 't': sb_addc(&b, '\t'); break;
+      case '"': sb_addc(b, '"'); break;
+      case '\\': sb_addc(b, '\\'); break;
+      case '/': sb_addc(b, '/'); break;
+      case 'b': sb_addc(b, '\b'); break;
+      case 'f': sb_addc(b, '\f'); break;
+      case 'n': sb_addc(b, '\n'); break;
+      case 'r': sb_addc(b, '\r'); break;
+      case 't': sb_addc(b, '\t'); break;
       case 'u': {
         uint32_t cp;
         if (j->i + 4 > j->n || !parse_hex4(j->p + j->i, &cp)) {
-          sb_free(&b);
           jp_err(j, "bad \\u escape");
           return 1;
         }
@@ -111,18 +109,16 @@ static int jp_string(JP *j, Slice *out) {
         }
         char enc[4];
         size_t el = utf8_encode(cp, enc);
-        sb_addn(&b, enc, el);
+        sb_addn(b, enc, el);
         break;
       }
       default:
-        sb_free(&b);
         jp_err(j, "bad escape");
         return 1;
     }
   }
-  char *s = arena_dup(j->a, b.buf, b.len);
-  size_t n = b.len;
-  sb_free(&b);
+  char *s = arena_dup(j->a, b->buf, b->len);
+  size_t n = b->len;
   *out = sl(s, n);
   return 0;
 }
@@ -282,25 +278,35 @@ Val *json_parse(Arena *a, Slice text, StrBuf *err_out) {
   j.i = 0;
   j.a = a;
   j.err = err_out;
+  StrBuf scratch;
+  sb_init(&scratch);
+  j.scratch = &scratch;
   Val *v = jp_value(&j);
-  if (!v) return NULL;
+  if (!v) {
+    sb_free(&scratch);
+    return NULL;
+  }
   jp_ws(&j);
   if (j.i != j.n) {
     jp_err(&j, "trailing data");
+    sb_free(&scratch);
     return NULL;
   }
+  sb_free(&scratch);
   return v;
 }
 
 // ---------------- serializer ----------------
 // Mask of bytes in a 16-byte chunk that need escaping in a JSON string:
 // '"' (0x22), '\\' (0x5C), or any control byte < 0x20.
-static inline int json_escape_mask(const char *p) {
+// The broadcast vectors are computed once per string by the caller.
+static inline int json_escape_mask(const char *p, __m128i v80, __m128i vA0, __m128i vQ,
+                                   __m128i vBS) {
   __m128i v = _mm_loadu_si128((const __m128i *)p);
-  __m128i flipped = _mm_xor_si128(v, _mm_set1_epi8((char)0x80));
-  __m128i ctrl = _mm_cmplt_epi8(flipped, _mm_set1_epi8((char)0xA0)); // byte < 0x20
-  __m128i q = _mm_cmpeq_epi8(v, _mm_set1_epi8('"'));
-  __m128i bs = _mm_cmpeq_epi8(v, _mm_set1_epi8('\\'));
+  __m128i flipped = _mm_xor_si128(v, v80);
+  __m128i ctrl = _mm_cmplt_epi8(flipped, vA0); // byte < 0x20
+  __m128i q = _mm_cmpeq_epi8(v, vQ);
+  __m128i bs = _mm_cmpeq_epi8(v, vBS);
   return _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(ctrl, q), bs));
 }
 
@@ -324,12 +330,16 @@ static void json_escape_byte(StrBuf *out, unsigned char c) {
 
 void json_quote_sb(StrBuf *out, Slice s) {
   sb_addc(out, '"');
+  const __m128i v80 = _mm_set1_epi8((char)0x80);
+  const __m128i vA0 = _mm_set1_epi8((char)0xA0);
+  const __m128i vQ = _mm_set1_epi8('"');
+  const __m128i vBS = _mm_set1_epi8('\\');
   size_t i = 0;
   while (i < s.n) {
     size_t j = i;
     // SSE2 chunks
     while (j + 16 <= s.n) {
-      int m = json_escape_mask(s.p + j);
+      int m = json_escape_mask(s.p + j, v80, vA0, vQ, vBS);
       if (m) {
         j += (size_t)__builtin_ctz((unsigned)m);
         break;

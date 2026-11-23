@@ -154,9 +154,15 @@ static long find_unescaped(const char *s, size_t n, const char *what, size_t wle
 
 static long find_single_star(const char *s, size_t n, size_t from) {
   static const uint8_t SET[2] = {'\\', '*'};
+  static __m128i vec[2];
+  static int vec_ready = 0;
+  if (!vec_ready) {
+    for (int k = 0; k < 2; k++) vec[k] = _mm_set1_epi8((char)SET[k]);
+    vec_ready = 1;
+  }
   size_t j = from;
   while (j < n) {
-    size_t f = sse2_find_any(s + j, n - j, SET, 2);
+    size_t f = sse2_find_any_v(s + j, n - j, vec, SET, 2);
     if (f >= n - j) return -1;
     j += f;
     char c = s[j];
@@ -199,9 +205,15 @@ static int has_ws(Slice t) {
 
 static void md_inline(Arena *a, StrBuf *out, const char *s, size_t n, MdEnv *env) {
   static const uint8_t SPEC[9] = {'\\', '`', '*', '[', '&', '<', '>', '"', '\''};
+  static __m128i spec_vec[9];
+  static int spec_vec_ready = 0;
+  if (!spec_vec_ready) {
+    for (int k = 0; k < 9; k++) spec_vec[k] = _mm_set1_epi8((char)SPEC[k]);
+    spec_vec_ready = 1;
+  }
   size_t i = 0;
   while (i < n) {
-    size_t j = sse2_find_any(s + i, n - i, SPEC, 9);
+    size_t j = sse2_find_any_v(s + i, n - i, spec_vec, SPEC, 9);
     if (j > 0) sb_addn(out, s + i, j);
     i += j;
     if (i >= n) break;
@@ -321,6 +333,11 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
     }
   }
   // lex into blocks (arena)
+  // One scratch StrBuf for the whole function (list-item / paragraph
+  // accumulation in lex, quote join in render): sequential uses only, so
+  // reuse is exact and avoids a malloc/free per block, item and paragraph.
+  StrBuf scratch;
+  sb_init(&scratch);
   size_t bcap = 32, nblocks = 0;
   Block *blocks = (Block *)arena_alloc(a, bcap * sizeof(Block));
   size_t i = 0;
@@ -455,18 +472,16 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
         int hit = is_ordered ? m_o : m_b;
         if (hit) {
           Slice first = trim_line(is_ordered ? ocap2 : cap_s);
-          // start new item: store as a StrBuf-backed slice in arena later; keep parts in temp list
-          // Simplify: accumulate the item text in a StrBuf now.
-          StrBuf ib;
-          sb_init(&ib);
-          sb_add(&ib, first);
+          // start new item: accumulate the item text in the scratch buffer.
+          scratch.len = 0;
+          sb_add(&scratch, first);
           i++;
           // continued lines for this item
           while (i < nlines && !((is_ordered ? ordered_of(lines[i], &num2, &ocap2)
                                              : bullet_of(lines[i], &cap_s)))) {
             if (!is_continued(lines[i])) break;
-            sb_addc(&ib, '\n');
-            sb_add(&ib, trim_line(lines[i]));
+            sb_addc(&scratch, '\n');
+            sb_add(&scratch, trim_line(lines[i]));
             i++;
           }
           if (ni == icap) {
@@ -476,9 +491,8 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
             items = np;
             icap = nc;
           }
-          char *ip = arena_dup(a, ib.buf, ib.len);
-          items[ni++] = sl(ip, ib.len);
-          sb_free(&ib);
+          char *ip = arena_dup(a, scratch.buf, scratch.len);
+          items[ni++] = sl(ip, scratch.len);
         } else if (is_continued(lines[i])) {
           // continued line with no current item: cannot happen (an item always exists here
           // because we only enter this branch after at least one hit), but mirror vendor:
@@ -504,21 +518,19 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
     }
     // paragraph
     {
-      StrBuf pb;
-      sb_init(&pb);
-      sb_add(&pb, trim_line(line));
+      scratch.len = 0;
+      sb_add(&scratch, trim_line(line));
       i++;
       while (i < nlines && !ends_paragraph(lines[i])) {
-        sb_addc(&pb, '\n');
-        sb_add(&pb, trim_line(lines[i]));
+        sb_addc(&scratch, '\n');
+        sb_add(&scratch, trim_line(lines[i]));
         i++;
       }
       Block b;
       memset(&b, 0, sizeof(b));
       b.kind = B_PARA;
-      char *tp = arena_dup(a, pb.buf, pb.len);
-      b.text = sl(tp, pb.len);
-      sb_free(&pb);
+      char *tp = arena_dup(a, scratch.buf, scratch.len);
+      b.text = sl(tp, scratch.len);
       if (nblocks == bcap) {
         size_t nc = bcap * 2;
         Block *np = (Block *)arena_alloc(a, nc * sizeof(Block));
@@ -530,35 +542,33 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
     }
   }
 
-  // render
+  // render — blocks go straight into `html` (no per-block temp buffer);
+  // the shared scratch serves the quote join. Excerpt + heading TOC html
+  // are captured as offsets into html and copied out at the end.
   StrSet ids;
   strset_init(&ids, a);
   StrBuf html;
   sb_init(&html);
-  StrBuf excerpt;
-  sb_init(&excerpt);
+  size_t ex_start = 0, ex_end = 0;
   int have_excerpt = 0;
   out->toc = NULL;
   out->ntoc = 0;
   out->captoc = 0;
   for (size_t bi = 0; bi < nblocks; bi++) {
     Block *t = &blocks[bi];
-    StrBuf blk;
-    sb_init(&blk);
     switch (t->kind) {
       case B_HEADING: {
         Slice id = unique_slug(a, slugify(a, t->text), &ids);
-        StrBuf hb;
-        sb_init(&hb);
-        md_inline(a, &hb, t->text.p, t->text.n, env);
         char num[16];
         int nn = snprintf(num, sizeof(num), "<h%d id=\"", t->depth);
-        sb_addn(&blk, num, (size_t)nn);
-        sb_add(&blk, id);
-        sb_addcstr(&blk, "\">");
-        sb_addn(&blk, hb.buf, hb.len);
+        sb_addn(&html, num, (size_t)nn);
+        sb_add(&html, id);
+        sb_addcstr(&html, "\">");
+        size_t h_start = html.len;
+        md_inline(a, &html, t->text.p, t->text.n, env);
+        size_t h_end = html.len;
         nn = snprintf(num, sizeof(num), "</h%d>", t->depth);
-        sb_addn(&blk, num, (size_t)nn);
+        sb_addn(&html, num, (size_t)nn);
         if (t->depth == 2 || t->depth == 3) {
           if (out->ntoc == out->captoc) {
             size_t nc = out->captoc ? out->captoc * 2 : 8;
@@ -567,49 +577,47 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
             out->toc = (void *)np;
             out->captoc = nc;
           }
-          char *hp = arena_dup(a, hb.buf, hb.len);
+          char *hp = arena_dup(a, html.buf + h_start, h_end - h_start);
           char *ip = arena_dup(a, id.p, id.n);
           out->toc[out->ntoc].level = t->depth;
           out->toc[out->ntoc].id = sl(ip, id.n);
-          out->toc[out->ntoc].html = sl(hp, hb.len);
+          out->toc[out->ntoc].html = sl(hp, h_end - h_start);
           out->ntoc++;
         }
-        sb_free(&hb);
         break;
       }
       case B_CODE: {
-        sb_addcstr(&blk, "<pre><code");
+        sb_addcstr(&html, "<pre><code");
         if (t->lang.n > 0) {
-          sb_addcstr(&blk, " class=\"language-");
-          escape_html_sb_slice(&blk, t->lang);
-          sb_addc(&blk, '"');
+          sb_addcstr(&html, " class=\"language-");
+          escape_html_sb_slice(&html, t->lang);
+          sb_addc(&html, '"');
         }
-        sb_addc(&blk, '>');
+        sb_addc(&html, '>');
         for (size_t k = 0; k < t->nlines; k++) {
-          escape_html_sb_slice(&blk, t->lines[k]);
-          sb_addc(&blk, '\n');
+          escape_html_sb_slice(&html, t->lines[k]);
+          sb_addc(&html, '\n');
         }
-        sb_addcstr(&blk, "</code></pre>");
+        sb_addcstr(&html, "</code></pre>");
         break;
       }
       case B_HR:
-        sb_addcstr(&blk, "<hr>");
+        sb_addcstr(&html, "<hr>");
         break;
       case B_QUOTE: {
         if (t->nlines == 0) {
-          sb_addcstr(&blk, "<blockquote>\n</blockquote>");
+          sb_addcstr(&html, "<blockquote>\n</blockquote>");
         } else {
-          sb_addcstr(&blk, "<blockquote>\n<p>");
-          // join lines with '\n' then inline
-          StrBuf qb;
-          sb_init(&qb);
+          sb_addcstr(&html, "<blockquote>\n<p>");
+          // join lines with '\n' then inline (join must precede inline:
+          // markup may span lines)
+          scratch.len = 0;
           for (size_t k = 0; k < t->nlines; k++) {
-            if (k) sb_addc(&qb, '\n');
-            sb_add(&qb, t->lines[k]);
+            if (k) sb_addc(&scratch, '\n');
+            sb_add(&scratch, t->lines[k]);
           }
-          md_inline(a, &blk, qb.buf, qb.len, env);
-          sb_free(&qb);
-          sb_addcstr(&blk, "</p>\n</blockquote>");
+          md_inline(a, &html, scratch.buf, scratch.len, env);
+          sb_addcstr(&html, "</p>\n</blockquote>");
         }
         break;
       }
@@ -617,46 +625,43 @@ void render_markdown(Arena *a, Slice src, MdEnv *env, MdOut *out) {
         if (t->ordered && t->start != 1) {
           char num[32];
           int nn = snprintf(num, sizeof(num), "<ol start=\"%d\">", t->start);
-          sb_addn(&blk, num, (size_t)nn);
+          sb_addn(&html, num, (size_t)nn);
         } else {
-          sb_addcstr(&blk, t->ordered ? "<ol>" : "<ul>");
+          sb_addcstr(&html, t->ordered ? "<ol>" : "<ul>");
         }
-        sb_addc(&blk, '\n');
+        sb_addc(&html, '\n');
         for (size_t k = 0; k < t->nitems; k++) {
-          sb_addcstr(&blk, "<li>");
-          md_inline(a, &blk, t->items[k].p, t->items[k].n, env);
-          sb_addcstr(&blk, "</li>\n");
+          sb_addcstr(&html, "<li>");
+          md_inline(a, &html, t->items[k].p, t->items[k].n, env);
+          sb_addcstr(&html, "</li>\n");
         }
-        sb_addcstr(&blk, t->ordered ? "</ol>" : "</ul>");
+        sb_addcstr(&html, t->ordered ? "</ol>" : "</ul>");
         break;
       }
       case B_PARA: {
-        StrBuf ph;
-        sb_init(&ph);
-        md_inline(a, &ph, t->text.p, t->text.n, env);
+        sb_addcstr(&html, "<p>");
         if (!have_excerpt) {
-          sb_addn(&excerpt, ph.buf, ph.len);
+          ex_start = html.len;
+          md_inline(a, &html, t->text.p, t->text.n, env);
+          ex_end = html.len;
           have_excerpt = 1;
+        } else {
+          md_inline(a, &html, t->text.p, t->text.n, env);
         }
-        sb_addcstr(&blk, "<p>");
-        sb_addn(&blk, ph.buf, ph.len);
-        sb_addcstr(&blk, "</p>");
-        sb_free(&ph);
+        sb_addcstr(&html, "</p>");
         break;
       }
     }
-    sb_addn(&html, blk.buf, blk.len);
     sb_addc(&html, '\n');
-    sb_free(&blk);
   }
   char *hp = arena_dup(a, html.buf, html.len);
   out->html = sl(hp, html.len);
-  sb_free(&html);
   if (have_excerpt) {
-    char *ep = arena_dup(a, excerpt.buf, excerpt.len);
-    out->excerpt = sl(ep, excerpt.len);
+    char *ep = arena_dup(a, html.buf + ex_start, ex_end - ex_start);
+    out->excerpt = sl(ep, ex_end - ex_start);
   } else {
     out->excerpt = sl("", 0);
   }
-  sb_free(&excerpt);
+  sb_free(&html);
+  sb_free(&scratch);
 }

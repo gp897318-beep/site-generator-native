@@ -81,7 +81,44 @@ void sb_free(StrBuf *b);
 // ---------------- UTF-8 ----------------
 // Decode one code point at p (n bytes left). *adv = bytes consumed (1..4).
 // Invalid bytes yield the byte value itself with *adv = 1.
-uint32_t utf8_decode(const char *p, size_t n, size_t *adv);
+// UTF-8 decode: static inline so the per-codepoint call sites (slugify,
+// template rendering, has_ws) pay no cross-TU call overhead; the ASCII
+// fast path is a single branch.
+static inline uint32_t utf8_decode(const char *p, size_t n, size_t *adv) {
+  if (n == 0) {
+    *adv = 0;
+    return 0;
+  }
+  unsigned char c = (unsigned char)p[0];
+  if (c < 0x80) {
+    *adv = 1;
+    return c;
+  }
+  if ((c & 0xE0) == 0xC0 && n >= 2 && ((unsigned char)p[1] & 0xC0) == 0x80) {
+    uint32_t cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+    if (cp >= 0x80) {
+      *adv = 2;
+      return cp;
+    }
+  } else if ((c & 0xF0) == 0xE0 && n >= 3 && ((unsigned char)p[1] & 0xC0) == 0x80 &&
+             ((unsigned char)p[2] & 0xC0) == 0x80) {
+    uint32_t cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F);
+    if (cp >= 0x800 && !(cp >= 0xD800 && cp <= 0xDFFF)) {
+      *adv = 3;
+      return cp;
+    }
+  } else if ((c & 0xF8) == 0xF0 && n >= 4 && ((unsigned char)p[1] & 0xC0) == 0x80 &&
+             ((unsigned char)p[2] & 0xC0) == 0x80 && ((unsigned char)p[3] & 0xC0) == 0x80) {
+    uint32_t cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) |
+                  (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
+    if (cp >= 0x10000 && cp <= 0x10FFFF) {
+      *adv = 4;
+      return cp;
+    }
+  }
+  *adv = 1;
+  return c; // invalid byte: yield raw byte value (never a-z0-9, so a gap in slugify)
+}
 size_t utf8_encode(uint32_t cp, char out[4]);
 Slice js_trim(Slice s); // JS String trim (WhiteSpace + LineTerminator)
 
@@ -91,6 +128,25 @@ Slice js_trim(Slice s); // JS String trim (WhiteSpace + LineTerminator)
 static inline size_t sse2_find_any(const char *p, size_t n, const uint8_t *set, int nset) {
   __m128i vec[16];
   for (int i = 0; i < nset; i++) vec[i] = _mm_set1_epi8((char)set[i]);
+  size_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    __m128i v = _mm_loadu_si128((const __m128i *)(p + i));
+    __m128i acc = _mm_setzero_si128();
+    for (int k = 0; k < nset; k++) acc = _mm_or_si128(acc, _mm_cmpeq_epi8(v, vec[k]));
+    int m = _mm_movemask_epi8(acc);
+    if (m) return i + (size_t)__builtin_ctz((unsigned)m);
+  }
+  for (; i < n; i++) {
+    unsigned char c = (unsigned char)p[i];
+    for (int j = 0; j < nset; j++)
+      if (c == set[j]) return i;
+  }
+  return n;
+}
+// Same as sse2_find_any but with precomputed broadcast vectors
+// (vec[k] = _mm_set1_epi8(set[k])); the scalar tail uses `set`.
+static inline size_t sse2_find_any_v(const char *p, size_t n, const __m128i *vec, const uint8_t *set,
+                                     int nset) {
   size_t i = 0;
   for (; i + 16 <= n; i += 16) {
     __m128i v = _mm_loadu_si128((const __m128i *)(p + i));

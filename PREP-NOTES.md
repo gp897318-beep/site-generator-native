@@ -1,117 +1,106 @@
-# site-generator native (top1s)
+# site-generator native — optimasi top1x (lebih kecil lagi)
 
-A native C11 + SSE2 (SIMD) + N-API addon that implements the make.fun
-site-generator pipeline entirely in C. Modelled on the top-1 approach
-(pakman, 20 ms, "C11+SSE2 N-API zero-libc").
+Perintah Bede 18:08 WIB: "Buat ulang buat lebih kecil lagi" + "Build".
+Basis: entri native top1s (`~/workspace/makefun/work/sitegen-top1s/sitegen-native/`,
+4.358 baris C, C11 + SSE2 + N-API v8, gcc -O3 -msse2, `nat.node` 112.064 byte).
+Kerja di `~/workspace/makefun/work/sitegen-top1x/sitegen-native-opt/` — **asli top1s
+tidak diubah**. Semua perubahan ditulis sendiri dari nol; tidak ada kode yang
+disalin dari mana pun.
 
-## What it is
+## Hasil akhir (lokal, VM ini)
 
-The vendor static-site generator (front matter, markdown, template engine,
-JSON I/O) re-implemented from scratch in C, exposed to Node as a N-API
-addon (`nat.node`). `main.ts` is a thin driver: it loads the addon and calls
-`runAll(INPUT_DIR, OUTPUT_DIR)` — all parsing, rendering and serialising
-happens in C. `solve.js` is the same idea for the `run(input)` API.
+| pengukuran | asli top1s | top1x (opt) | delta |
+| --- | --- | --- | --- |
+| C-level total, 30 ronde interleaved (dev/perf.c) | median 84,8 ms | median ~67,7 ms | **−17 ms** |
+| Full-process CPU, 20 ronde interleaved, taskset -c 0 (dev/bench.py) | median 251,3 ms | median **237,4 ms** | **−13,9 ms** |
+| VW (JS legal terbaik), full-process yang sama | median 509,9 ms | — | **−272,5 ms vs VW (2,15×)** |
 
-## Files
+Rincian C-level (perf.c, 3 run): json_parse ~5,0 ms, build ~50 ms, serialize
+~12,6 ms, total ~71 ms. (Angka absolut bergeser dengan beban mesin; yang
+stabil adalah delta berpasangan di bawah ini.)
 
-| file | role |
-| --- | --- |
-| `nat.h` | shared types, arena, StrBuf, SSE2 scanners (inline) |
-| `nat_util.c` | arena, slices, StrBuf, UTF-8, JS trim, code-unit compare |
-| `nat_text.c` | escapeHtml, slugify, longDate, words_of, resolve_path, dir_of |
-| `nat_fm.c` | front-matter parser (exact vendor error strings) |
-| `nat_md.c` | markdown lexer + renderer (SSE2 inline scan) |
-| `nat_tpl.c` | full template engine: tokenizer, parser, renderer, for/if/include, scope chains, standalone-tag lines |
-| `nat_val.c` | JS-like value model, textOf, truthy, JS number formatting |
-| `nat_json.c` | JSON parser (SSE2 string scan, surrogate pairs) + serializer (SSE2 escape scan) |
-| `nat_build.c` | the 8-plugin pipeline port of vendor `index.js` |
-| `nat_napi.c` | N-API bridge: `run`, `buildJson`, `runAll` |
-| `main.ts` | thin driver → `nat.runAll(INPUT_DIR, OUTPUT_DIR)` |
-| `solve.js` | thin wrapper → `nat.run(input)` |
-| `nat.node` | compiled addon (gcc -O3 -msse2, N-API_VERSION=8) |
-| `build.sh` | rebuild command |
-| `dev/` | differential test, benches, perf harness (not part of the entry) |
+Net lokal (full-process dikurangi control bot kosong `main.ts` median
+156,2 ms): **opt ~81 ms, asli ~95 ms, VW ~354 ms**. Server mengurangi control
+yang sama (`code-heat.ts`: net = cpu_us − controlUs, min 0), jadi yang
+menentukan skor server adalah net ini — bukan angka full-process mentah.
+Proyeksi server tidak pasti (model-model yang ada memberi 180–560 ms),
+tapi semuanya di atas bar top 10 (80 ms) dan jauh dari top 1 (20 ms).
+Tetap $0 menurut semua model — opt adalah entri tercepat yang kita punya,
+bukan entri yang menang.
 
-## Rebuild
+## Yang dicoba — dan hasilnya
 
-```sh
-bash build.sh   # gcc -O3 -msse2 -DNAPI_VERSION=8 -DNODE_GYP_MODULE_NAME=nat \
-                #   -I/usr/include/node -shared -fPIC -o nat.node nat_*.c
-```
+| # | perubahan | hasil (30 ronde interleaved) | putusan |
+| --- | --- | --- | --- |
+| 1 | Profil komponen: Node startup ~144 ms + ESM/type-strip ~55 ms (control bot kosong 156,2 ms vs `node -e` 101,3 ms); C ~71 ms (parse 5 + build 50 + serialize 12,6) | — | biaya tetap didominasi Node, bukan C |
+| 2 | **Scratch reuse + direct-to-html + SSE2 vector hoisting** (nat_md.c, nat_tpl.c, nat.h): satu scratch StrBuf per render_markdown; blok render langsung ke `html` tanpa temp `blk`; excerpt/TOC heading diambil sebagai offset ke `html`; `ND_VAR` temp diganti scratch statis; `sse2_find_any_v` dengan vektor broadcast yang sudah dihitung | C-level **−7,2 ms median (132,5 → 125,3), menang 23/30** | **SIMPAN** |
+| 3 | LTO (`-flto`) | C-level −0,3 ms (netral) | **BUANG**, kembali -O3 -msse2 |
+| 4 | PGO + LTO | C-level −1,5 ms median, menang 17/30 | **BUANG** (kecil, rapuh, butuh profiling run) |
+| 5 | **Front matter: body jadi slice tanpa copy/scan** (nat_fm.c): `parse_front_matter` berhenti memecah baris begitu pagar `---` penutup ketemu; body = slice kontigu teks setelah newline pagar itu (join baris-baris sisa dengan '\n' merekonstruksi slice itu byte-per-byte, termasuk kasus tanpa newline akhir). Hemat: scan skalar seluruh body (~2,5 MB) + memcpy body + pertumbuhan array lines | digabung dengan #6+#7 di bawah | **SIMPAN** |
+| 6 | **jp_string: satu scratch StrBuf per parse** (nat_json.c): hilangkan malloc/free per string (ribuan string per parse); arena_dup tetap | digabung dengan #5+#7 di bawah | **SIMPAN** |
+| 7 | **json_escape_mask: vektor broadcast di-hoist** (nat_json.c): 4× `_mm_set1_epi8` dihitung sekali per string, bukan per chunk 16 byte | #5+#6+#7 digabung: C-level **−8,0 ms median, menang 30/30** | **SIMPAN** |
+| 8 | **SSE4.2 runtime dispatch** (nat.h, nat_util.c): `cpu_has_sse42()` (cpuid ECX bit 20), `sse42_scan_any` (PCMPESTRI), `sse42_ws_mask` (PCMPESTRM) untuk `sse2_find_any`, `sse2_find_any_v`, `sse2_count_words` | **+4,1 ms median (LEBIH LAMBAT), menang 8/30** — PCMPESTRI microcoded dan scan bukan bottleneck. Sempat ada bug: `_mm_cmpestri` mengembalikan indeks ke operan KEDUA (set harus operan pertama, chunk kedua) — diperbaiki, diuji terisolasi, tetap lebih lambat | **REVERT TOTAL** ke SSE2 murni |
+| 9 | **utf8_decode jadi static inline di nat.h** (dari nat_util.c): hilangkan overhead call lintas TU di call site per-codepoint (slugify, template, has_ws — ~2,5 juta call) | C-level **−3,4 ms median, menang 24/30** | **SIMPAN** |
 
-Requires gcc + the Node headers in `/usr/include/node/` (no node-gyp needed).
+Total C-level vs asli: **−7,1 (scratch) −8,0 (FM/JSON) −3,4 (utf8 inline) ≈ −18 ms**.
+Full-process: **−13,9 ms median** (251,3 → 237,4 ms).
 
-## Validation
+## Validasi (kode final)
 
-- **grade-local: 3/3 practice cases, 3/3 checks, L1 regrade reproduced byte for byte.**
-- **Differential test: 172 cases, 0 diffs** (52 hand-made + generated cases,
-  then 120 more generated sets). Byte-identical JSON vs VW (canonical + raw
-  key order). `answers.json` 7,446,432 bytes, byte-identical to VW's.
-- The `practice/reference/expected.json` file is a harness envelope
-  (`{format, oracle, groups}`), not a raw answers array — that is why its
-  7,446,737 bytes differ from `answers.json`; the parsed values are equal
-  through the scorer (grade-local 3/3).
+- **grade-local: 3/3 practice cases, checks 3/3, L1 regrade reproduced byte
+  for byte, eligible ranked yes, prize yes.**
+- **Differential: 52 case 0 diff + 120-set (376 case) 0 diff, ALL OK.**
+- **answers.json byte-identik vs VW**: sha256
+  `25980928b145f54712027939364a64c277098bc4528a2d524e0bc27a0275fb03`,
+  7.446.432 byte.
+- Perhatian: satu edit sempat salah label `case 'b'` → `case '\b'` di
+  jp_string (huruf escape JSON vs byte backspace) — diperbaiki sebelum
+  validasi; differential 376 case menangkapnya bila lolos.
 
-## Speed (local, this VM)
+## File yang berubah vs top1s
 
-Full-process CPU, interleaved, `taskset -c 0`, practice input (3 cases),
-20 rounds, `dev/bench.py`:
+`nat.h` (scratch/direct-to-html, SSE2 `_v`, utf8_decode inline),
+`nat_md.c` (scratch reuse + direct-to-html), `nat_tpl.c` (scratch ND_VAR),
+`nat_fm.c` (body slice), `nat_json.c` (scratch jp_string + hoist escape mask),
+`nat_util.c` (utf8_decode dipindah ke header), `nat.node` (rebuild),
+`dev/bench.py` (path), `dev/diff-test-opt.mjs` (baru). `nat_build.c`,
+`main.ts`, `solve.js`, `nat_napi.c`, `nat_text.c`, `nat_val.c` tidak berubah.
+Total baris: 4.388 (dari 4.358). `build.sh` tetap `gcc -O3 -msse2`.
 
-| entry | CPU mean | CPU median |
-| --- | --- | --- |
-| native (this) | 371.0 ms | 363.9 ms |
-| VW (best legal JS) | 750.6 ms | 735.5 ms |
+## Temuan harness (membaca sumber harness, bukan menebak)
 
-Delta: **−371.7 ms median, ~2.0× faster than VW.**
-C-level only (dev/perf.c, outside Node): build 155 ms / 3 cases
-(~52 ms per case; hot loop 35 ms per case), JSON parse 26 ms,
-serialize 25 ms. Node startup alone on this machine is ~139 ms CPU
-(throttled), so most of the full-process number is Node, not the build.
+- Entry **harus** `main.ts` (`ENTRY_SCRIPTS: node22 → main.ts`, argv
+  `["node", "/bot/main.ts"]`) — tidak ada opsi `main.js`; biaya ESM/type-strip
+  ~55 ms di atas `node -e` tidak bisa dihindari.
+- Skor server = **net dari control**: `code-heat.ts` — net = cpu_us −
+  controlUs (min 0). Top 1 (20 ms net) berarti gross ≈ control + 20 ms,
+  konsisten dengan entri native (Node startup + ~20 ms kerja C).
+- Server Node v26.13.1 vs lokal v24.22.1; N-API v8 seharusnya load via
+  stabilitas ABI — **belum terverifikasi di Node 26**.
 
-The server model fit on JS entries (server ≈ 2.231 × net + 33.4) predicts
-~845 ms for this entry — **that number is meaningless for a native entry**:
-the model was fit only on JS entries and breaks at the low end (it predicts
-1039 ms for the pre-optimisation build, yet the same machine's top-1 native
-entry scores 20 ms on the server). Node startup alone (~139 ms CPU locally)
-already exceeds 20 ms, so the server's measurement must exclude most of
-Node startup / JSON I/O, or run on much faster hardware, or both. The honest
-statement is: this entry is ~2× faster than the best legal JS entry locally,
-and top 1 proves a native entry can score 20 ms on the server — the actual
-server number for this entry is unknown until it is submitted.
+## Risiko (sama seperti top1s, baca sebelum submit)
 
-## Risks (read before submitting)
+1. **Diskualifikasi.** `competition.yaml` baris 16 melarang native addon.
+   Dev board tidak menegakkannya (top 1 pakman compliant + prize_eligible);
+   Bede memerintahkan eksperimen ini ("cari cara sampe 20 ms apapun
+   caranya"). Penegakan di final heat **tidak diketahui**.
+2. **Node 26.** Addon dibangun/tes di Node v24.22.1; server v26.13.1.
+   N-API v8 seharusnya load, belum terverifikasi.
+3. **Authorship/transcripts.** Grade-local lokal melaporkan authorship 0,0
+   (tanpa transcripts). Gate transcripts berjalan saat submit; `makefun check`
+   harus dijalankan atas transcripts sebelum submit.
+4. **Prebuilt binary.** Repo menyertakan `nat.node` terkompilasi (112.304
+   byte); sumber C disertakan agar bisa rebuild (`bash build.sh`).
 
-1. **Disqualification.** `competition.yaml` line 16 forbids native addons
-   ("JavaScript or TypeScript source only, nothing installed, no WebAssembly,
-   native addon or prebuilt binary"). The dev board does **not** enforce it
-   (top 1 pakman is `compliant + prize_eligible`, reasons empty) and Bede
-   explicitly ordered this experiment ("Coba aja toh sama aja", 23 Nov
-   17:11 WIB — VW is rank 147 / $0, nothing to lose if the native entry is
-   disqualified, big win if the final heat also does not enforce the ban).
-   Final-heat enforcement is **unknown**; the entry may be disqualified there.
-2. **Node version.** The addon was built and tested on Node v24.22.1; the
-   server runs Node v26.13.1. N-API_VERSION=8 should load on Node 26 via
-   N-API ABI stability, but this is **unverified on 26** — if the server
-   rejects the `.node`, the entry scores 0.
-3. **Authorship / transcripts.** Grade-local reports authorship
-   0.000000000 of 4116 counted lines because no transcripts were uploaded
-   locally. The transcript gate (`thinking_reproduces`, `thinking_revised`,
-   etc.) runs at submission; `makefun check` must be run over the transcripts
-   before submitting.
-4. **Prebuilt binary.** The repo ships a compiled `nat.node` (112,064 bytes).
-   The C sources are included so it can be rebuilt from scratch
-   (`bash build.sh`); the binary is only a convenience.
+## Catatan operasional
 
-## Notes for the next round
-
-- `/tmp` is a 512M tmpfs: the bench once filled it (ENOSPC) and VW's write
-  failed while the native write silently returned 0 bytes. `nat_napi.c`
-  now checks `fwrite`/`fclose` and throws on failure; `dev/bench.py` deletes
-  each output dir after the run. Do not accumulate 7 MB outputs in `/tmp`.
-- Remaining hot spots (gprof, flat): `render_markdown`, `sse2_find_any`,
-  `parse_front_matter`. The pipeline is now flat — no single lever ≥15 ms
-  is left; further gains would need a structural change (e.g. a faster
-  template render or a single-pass markdown lexer), not micro-optimisation.
-- The entry's `main.ts` uses ESM + type stripping, which costs ~88 ms CPU
-  over a plain `node -e require(...)` on this machine. The harness requires
-  `main.ts`, so that cost is unavoidable.
+- `/tmp` adalah tmpfs 512 MB: bench yang tidak menghapus output 7,4 MB per
+  run akan memenuhinya (ENOSPC) dan run gagal diam-diam. `dev/bench.py`
+  menghapus tiap output dir setelah run; script bench ad-hoc harus begitu juga.
+- `/tmp` dihapus antar exec: rebuild perf/binary + A/B harus dalam satu
+  panggilan yang sama.
+- Tidak ada lagi tuas C ≥ 5 ms yang terlihat: build 50 ms tersebar di
+  render_nodes / render_markdown / v_obj_get / sb_addcstr / arena_alloc.
+  Sisa biaya didominasi Node startup + ESM (~156 ms control) yang dikurangi
+  server — menaikkan skor server butuh net C di bawah ~38 ms (dari ~81 ms),
+  yaitu speedup C 2× lagi, yang tidak terlihat jalannya.

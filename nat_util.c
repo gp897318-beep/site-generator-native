@@ -99,42 +99,7 @@ void sb_free(StrBuf *b) {
 }
 
 // ---------------- UTF-8 ----------------
-uint32_t utf8_decode(const char *p, size_t n, size_t *adv) {
-  if (n == 0) {
-    *adv = 0;
-    return 0;
-  }
-  unsigned char c = (unsigned char)p[0];
-  if (c < 0x80) {
-    *adv = 1;
-    return c;
-  }
-  if ((c & 0xE0) == 0xC0 && n >= 2 && ((unsigned char)p[1] & 0xC0) == 0x80) {
-    uint32_t cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
-    if (cp >= 0x80) {
-      *adv = 2;
-      return cp;
-    }
-  } else if ((c & 0xF0) == 0xE0 && n >= 3 && ((unsigned char)p[1] & 0xC0) == 0x80 &&
-             ((unsigned char)p[2] & 0xC0) == 0x80) {
-    uint32_t cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F);
-    if (cp >= 0x800 && !(cp >= 0xD800 && cp <= 0xDFFF)) {
-      *adv = 3;
-      return cp;
-    }
-  } else if ((c & 0xF8) == 0xF0 && n >= 4 && ((unsigned char)p[1] & 0xC0) == 0x80 &&
-             ((unsigned char)p[2] & 0xC0) == 0x80 && ((unsigned char)p[3] & 0xC0) == 0x80) {
-    uint32_t cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) |
-                  (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
-    if (cp >= 0x10000 && cp <= 0x10FFFF) {
-      *adv = 4;
-      return cp;
-    }
-  }
-  *adv = 1;
-  return c; // invalid byte: yield raw byte value (never a-z0-9, so a gap in slugify)
-}
-
+// (utf8_decode is static inline in nat.h; see there.)
 size_t utf8_encode(uint32_t cp, char out[4]) {
   if (cp < 0x80) {
     out[0] = (char)cp;

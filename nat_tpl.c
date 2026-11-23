@@ -440,6 +440,11 @@ int parse_template(Arena *a, Slice name, Slice src, Node **root_out, StrBuf *err
 }
 
 // ---------------- renderer ----------------
+// Scratch for ND_VAR non-string values: text_of_sb + escape complete before
+// any nested render_nodes call, so one reused buffer is exact (single-threaded).
+static StrBuf tpl_scratch;
+static int tpl_scratch_init = 0;
+
 static int scope_has(Scope *s, Slice name) {
   for (size_t i = 0; i < s->n; i++)
     if (slice_eq(s->names[i], name)) return 1;
@@ -510,11 +515,13 @@ void render_nodes(StrBuf *out, Node *nodes, Scope *scope, Template *templates, s
         if (v && v->tag == V_STR) {
           escape_html_sb(out, v->s.p, v->s.n);
         } else {
-          StrBuf t;
-          sb_init(&t);
-          text_of_sb(&t, v);
-          escape_html_sb(out, t.buf, t.len);
-          sb_free(&t);
+          if (!tpl_scratch_init) {
+            sb_init(&tpl_scratch);
+            tpl_scratch_init = 1;
+          }
+          tpl_scratch.len = 0;
+          text_of_sb(&tpl_scratch, v);
+          escape_html_sb(out, tpl_scratch.buf, tpl_scratch.len);
         }
         break;
       }
